@@ -1,0 +1,16 @@
+describe('create account', () => {
+  it('passes', () => {
+    cy.visit('http://localhost:3001')
+    cy.wait(2000)
+    cy.get("svg[data-icon='user']").click()
+    cy.wait(2000)
+    cy.get("input[id='signUpUsername']").type("User1")
+    cy.wait(2000)
+    cy.get("input[id='signUpPassword']").type("User1")
+    cy.wait(2000)
+    cy.get("button[id='register']").click()
+    cy.wait(5000)
+    cy.contains("Welcome User1")
+    cy.wait(3000)
+  })
+})

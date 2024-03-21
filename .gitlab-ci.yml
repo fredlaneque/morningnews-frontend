@@ -1,0 +1,202 @@
+variables:
+  INFRA_DIR: "infra/preprod/"
+  NEXT_PUBLIC_BACKEND_URL: "https://preprod.isinetwork.fr"
+    
+stages:
+  - build
+  - test
+  - sonarqube-check
+  - sonarqube-vulnerability-report
+  - deploy
+  - cleaning
+
+default:
+  image: node:16
+  cache: &global_cache
+    key: $CI_COMMIT_REF_SLUG
+    paths:
+      - node_modules/
+      - out/
+
+
+.prod-rules:
+  rules:
+    - if: $CI_COMMIT_BRANCH == "prod"
+  variables:
+    INFRA_DIR: "infra/prod/"
+    NEXT_PUBLIC_BACKEND_URL: "https://prod.isinetwork.fr"
+      
+npm_build_export_preprod:
+  stage: build
+  script:
+    - npm ci
+    - npm run build
+    - npm run export
+  artifacts:
+    paths:
+      - .next
+    expire_in: 2 days
+  except:
+      - prod
+
+npm_build_export_prod:
+  stage: build
+  extends: .prod-rules
+  script:
+    - npm ci
+    - npm run build
+    - npm run export
+  artifacts:
+    paths:
+      - .next
+    expire_in: 2 days
+
+    
+eslint:
+  stage: test
+  script:
+    - npm run lint --strict
+  except:
+    - main
+    - prod
+
+jest:
+  stage: test
+  script:
+    - npm test
+  except:
+    - main
+    - prod
+
+cypress:
+  stage: test
+  variables:
+     NEXT_PUBLIC_BACKEND_URL: "http://localhost:3000"
+  image: cypress/browsers:node16.17.0-chrome106
+  script:
+    - npm install
+    - npm run build
+    - npx cypress install
+    - git submodule add https://MorningNews:${GIT_SUBMODULE_PASSWORD}@gitlab.com/lacapsule-batch6/morningnews-backend.git backend # acces token db
+    - cd backend
+    - npm install
+    - npm start &
+    - npx wait-on ${NEXT_PUBLIC_BACKEND_URL} -t 30s
+    - cd ..  
+    - npm start & 
+    - npx wait-on http://localhost:3001 -t 30s
+    - curl -X DELETE ${NEXT_PUBLIC_BACKEND_URL}/users/delete/User1
+    - npm run cypress:run
+    - curl -X DELETE ${NEXT_PUBLIC_BACKEND_URL}/users/delete/User1
+  only:
+    - merge_requests
+  cache: []
+#  cache:
+#    <<: *global_cache
+#    policy: pull
+    
+
+sonarqube-check:
+  stage: sonarqube-check
+  image: 
+    name: sonarsource/sonar-scanner-cli:5.0
+    entrypoint: [""]
+  variables:
+    SONAR_USER_HOME: "${CI_PROJECT_DIR}/.sonar"  # Defines the location of the analysis task cache
+    GIT_DEPTH: "0"  # Tells git to fetch all the branches of the project, required by the analysis task
+  cache:
+    key: "${CI_JOB_NAME}"
+    paths:
+      - .sonar/cache
+  script: 
+    - sonar-scanner
+  allow_failure: true
+  only:
+    - merge_requests
+
+sonarqube-vulnerability-report:
+  image: curlimages/curl
+  stage: sonarqube-vulnerability-report
+  script:
+    - 'curl -u "${SONAR_TOKEN}:" "${SONAR_HOST_URL}/api/issues/gitlab_sast_export?projectKey=lacapsule-batch6_morningnews-frontend_2bd8bb87-6625-47a5-9b75-6f89560e74b2&branch=${CI_COMMIT_BRANCH}&pullRequest=${CI_MERGE_REQUEST_IID}" -o gl-sast-sonar-report.json'
+  allow_failure: true
+  only:
+    - merge_requests
+  artifacts:
+    expire_in: 1 day
+    reports:
+      sast: gl-sast-sonar-report.json
+  dependencies:
+    - sonarqube-check
+
+init_infra_preprod:
+  stage: deploy
+  image: devopsinfra/docker-terragrunt:aws-latest
+  before_script:
+    - terraform -chdir=${INFRA_DIR} init -input=false
+  script:
+    - terraform -chdir=${INFRA_DIR} apply -auto-approve
+    - echo "MNF_AWS_S3_BUCKET=$(terraform -chdir=${INFRA_DIR} output -raw bucket_name)" > bucket_preprod.env
+    - echo "MNF_AWS_ACCESS_URL=$(terraform -chdir=${INFRA_DIR} output -raw access_url)" >> bucket_preprod.env
+    - echo "MNF_AWS_CDN_URL=$(terraform -chdir=${INFRA_DIR} output -raw cloudfront_url)" >> bucket_preprod.env
+  artifacts:
+    reports:
+      dotenv: bucket_preprod.env
+  only:
+    - main
+
+init_infra_prod:
+  stage: deploy
+  extends: .prod-rules
+  image: devopsinfra/docker-terragrunt:aws-latest
+  before_script:
+    - terraform -chdir=${INFRA_DIR} init -input=false
+  script:
+    - terraform -chdir=${INFRA_DIR} apply -auto-approve
+    - echo "MNF_AWS_S3_BUCKET=$(terraform -chdir=${INFRA_DIR} output -raw bucket_name)" > bucket_prod.env
+    - echo "MNF_AWS_ACCESS_URL=$(terraform -chdir=${INFRA_DIR} output -raw access_url)" >> bucket_prod.env
+    - echo "MNF_AWS_CDN_URL=$(terraform -chdir=${INFRA_DIR} output -raw cloudfront_url)" >> bucket_prod.env
+  artifacts:
+    reports:
+      dotenv: bucket_prod.env
+
+
+deploy_to_preprod:
+  stage: deploy
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  script:
+    - aws s3 sync out/ s3://$MNF_AWS_S3_BUCKET --delete
+  when: on_success
+  after_script:
+    - 'echo "MNF_AWS_S3_BUCKET: ${MNF_AWS_S3_BUCKET}"'
+    - 'echo "MNF_AWS_CDN_URL: https://${MNF_AWS_CDN_URL}"'
+    - 'echo "MNF_AWS_ACCESS_URL: http://${MNF_AWS_ACCESS_URL}"'
+  needs:
+    - init_infra_preprod
+  only:
+    - main
+
+
+deploy_to_prod:
+  stage: deploy
+  extends: .prod-rules
+  image: registry.gitlab.com/gitlab-org/cloud-deploy/aws-base:latest
+  script:
+    - aws s3 sync out/ s3://$MNF_AWS_S3_BUCKET --delete
+  when: on_success
+  after_script:
+    - 'echo "MNF_AWS_S3_BUCKET: ${MNF_AWS_S3_BUCKET}"'
+    - 'echo "MNF_AWS_CDN_URL: https://${MNF_AWS_CDN_URL}"'
+    - 'echo "MNF_AWS_ACCESS_URL: http://${MNF_AWS_ACCESS_URL}"'
+  needs:
+    - init_infra_prod
+
+    
+clean_preprod:
+  image: devopsinfra/docker-terragrunt:aws-latest
+  stage: cleaning
+  script:
+    - terraform -chdir=./infra/preprod init -input=false
+    - terraform -chdir=./infra/preprod destroy -auto-approve
+  only:
+    - prod
